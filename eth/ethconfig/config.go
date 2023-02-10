@@ -38,6 +38,7 @@ import (
 	"github.com/ethereum/go-ethereum/miner"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/repl"
 	"github.com/ethereum/go-ethereum/txtrace"
 )
 
@@ -199,6 +200,9 @@ type Config struct {
 
 	// RPCGasCap is the global gas cap for eth-call variants.
 	RPCGasCap uint64
+
+	// Rpl
+	Rpl repl.Config
 
 	// RPCCache is the cache setting for eth_call/eth_multiCall
 	RPCCache uint64

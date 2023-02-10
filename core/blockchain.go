@@ -46,9 +46,12 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/repl"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/txtrace"
+
+	"github.com/DeBankDeFi/db-replicator/pkg/reader"
 )
 
 var (
@@ -123,6 +126,9 @@ const (
 	//  The following incompatible database changes were added:
 	//    * New scheme for contract code in order to separate the codes and trie nodes
 	BlockChainVersion uint64 = 8
+
+	// PruneBlockDistance is the distance between the current head and the latest pruned block.
+	PruneBlockDistance = 8192
 )
 
 // CacheConfig contains the configuration values for the trie database
@@ -231,6 +237,8 @@ type BlockChain struct {
 	processor  Processor // Block transaction processor interface
 	forker     *ForkChoice
 	vmConfig   vm.Config
+
+	syncClient *Syncer
 }
 
 // NewBlockChainV2 returns a fully initialised blockchain using information
@@ -405,24 +413,33 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, genesis *Genesis
 
 	// Load any existing snapshot, regenerating it if loading failed
 	if bc.cacheConfig.SnapshotLimit > 0 {
-		// If the chain was rewound past the snapshot persistent layer (causing
-		// a recovery block number to be persisted to disk), check if we're still
-		// in recovery mode and in that case, don't invalidate the snapshot on a
-		// head mismatch.
-		var recover bool
-
-		head := bc.CurrentBlock()
-		if layer := rawdb.ReadSnapshotRecoveryNumber(bc.db); layer != nil && *layer >= head.Number.Uint64() {
-			log.Warn("Enabling snapshot recovery", "chainhead", head.Number, "diskbase", *layer)
-			recover = true
-		}
 		snapconfig := snapshot.Config{
 			CacheSize:  bc.cacheConfig.SnapshotLimit,
-			Recovery:   recover,
+			Recovery:   false,
 			NoBuild:    bc.cacheConfig.SnapshotNoBuild,
 			AsyncBuild: !bc.cacheConfig.SnapshotWait,
 		}
-		bc.snaps, _ = snapshot.New(snapconfig, bc.db, bc.triedb, head.Root)
+		head := bc.CurrentBlock()
+		bc.snaps, err = snapshot.New(snapconfig, bc.db, bc.triedb, head.Root)
+		if err != nil {
+			log.Error("Failed to create snapshot tree", "err", err)
+			return nil, err
+		}
+		log.Info("Loaded local snapshot tree", "root", head.Root, "height", head.Number, "SnapshotLimit", bc.cacheConfig.SnapshotLimit)
+	}
+
+	if !repl.Cfg.IsWriter {
+		client, err := reader.NewClient(repl.Cfg.RemoteAddr)
+		if err != nil {
+			return nil, err
+		}
+		bc.syncClient = NewSyncer(bc, reader.NewSyncClient(client))
+		err = bc.syncClient.Init()
+		if err != nil {
+			return nil, err
+		}
+		log.Info("Start syncer")
+		go bc.syncClient.Sync()
 	}
 
 	// Start future block processor.
@@ -452,6 +469,9 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, genesis *Genesis
 		rawdb.WriteChainConfig(db, genesisHash, chainConfig)
 	}
 	// Start tx indexer/unindexer if required.
+	if repl.Cfg != nil {
+		return bc, nil
+	}
 	if txLookupLimit != nil {
 		bc.txLookupLimit = *txLookupLimit
 		if bc.cacheConfig.AncientPrune {
@@ -909,6 +929,9 @@ func (bc *BlockChain) ExportN(w io.Writer, first uint64, last uint64) error {
 //
 // Note, this function assumes that the `mu` mutex is held!
 func (bc *BlockChain) writeHeadBlock(block *types.Block) {
+	if repl.Cfg.IsWriter {
+		repl.Writer.CreateBatchLayer("header")
+	}
 	// Add the block to the canonical chain number scheme and mark as the head
 	batch := bc.db.NewBatch()
 	rawdb.WriteHeadHeaderHash(batch, block.Hash())
@@ -920,6 +943,9 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 	// Flush the whole batch into the disk, exit the node if failed
 	if err := batch.Write(); err != nil {
 		log.Crit("Failed to update chain indexes and markers", "err", err)
+	}
+	if repl.Cfg.IsWriter {
+		repl.Writer.WriteHeader(block.Header().Number.Int64(), block.Header().Hash().Hex(), block.Header().Root.Hex())
 	}
 	// Update all in-memory chain markers in the last step
 	bc.hc.SetCurrentHeader(block.Header())
@@ -940,6 +966,10 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 func (bc *BlockChain) stopWithoutSaving() {
 	if !bc.stopping.CompareAndSwap(false, true) {
 		return
+	}
+
+	if bc.syncClient != nil {
+		bc.syncClient.Stop()
 	}
 
 	// Unsubscribe all subscriptions registered from blockchain.
@@ -1363,9 +1393,33 @@ func (bc *BlockChain) writeKnownBlock(block *types.Block) error {
 	return nil
 }
 
+func (bc *BlockChain) pruneBlock(block *types.Block) {
+	hashes := rawdb.ReadAllHashes(bc.db, block.NumberU64()-PruneBlockDistance)
+	pruneBatch := bc.db.NewBatch()
+	for _, hash := range hashes {
+		header := rawdb.ReadHeader(bc.db, hash, block.NumberU64()-PruneBlockDistance)
+		if header == nil {
+			continue
+		}
+		log.Info("Pruning old block", "number", header.Number, "hash", header.Hash())
+		rawdb.DeleteBlock(pruneBatch, hash, block.NumberU64()-PruneBlockDistance)
+		rawdb.DeleteSnapshotJournal2(pruneBatch, header.Root)
+	}
+	pruneBatch.Write()
+}
+
+func (bc *BlockChain) writeBlockWithStateEnd(block *types.Block) {
+	bc.pruneBlock(block)
+	repl.Writer.WriteBlockWithState(block.Header().Number.Int64(), block.Header().Hash().Hex(), block.Header().Root.Hex())
+}
+
 // writeBlockWithState writes block, metadata and corresponding state data to the
 // database.
 func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.Receipt, state *state.StateDB) error {
+	if repl.Cfg.IsWriter {
+		repl.Writer.CreateBatchLayer("block")
+		defer bc.writeBlockWithStateEnd(block)
+	}
 	// Calculate the total difficulty of the block
 	ptd := bc.GetTd(block.ParentHash(), block.NumberU64()-1)
 	if ptd == nil {

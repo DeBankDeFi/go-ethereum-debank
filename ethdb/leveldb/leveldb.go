@@ -27,10 +27,12 @@ import (
 	"sync"
 	"time"
 
+	rdb "github.com/DeBankDeFi/db-replicator/pkg/db"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
+	"github.com/ethereum/go-ethereum/repl"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/filter"
@@ -81,6 +83,7 @@ type Database struct {
 	quitChan chan chan error // Quit channel to stop the metrics collection before closing the database
 
 	log log.Logger // Contextual logger tracking the database path
+	id  int32
 }
 
 // New returns a wrapped LevelDB object. The namespace is the prefix that the
@@ -148,6 +151,9 @@ func NewCustom(file string, namespace string, customize func(options *opt.Option
 
 	// Start up the metrics gathering and return
 	go ldb.meter(metricsGatheringInterval)
+	id := repl.Writer.Register(file, &wrapDB{db: ldb})
+	log.Info("Register database", "id", id, "file", file)
+	ldb.id = id
 	return ldb, nil
 }
 
@@ -210,8 +216,10 @@ func (db *Database) Delete(key []byte) error {
 // database until a final write is called.
 func (db *Database) NewBatch() ethdb.Batch {
 	return &batch{
-		db: db.db,
-		b:  new(leveldb.Batch),
+		db:        db.db,
+		b:         new(leveldb.Batch),
+		id:        db.id,
+		writeToDB: false,
 	}
 }
 
@@ -471,9 +479,11 @@ func (db *Database) meter(refresh time.Duration) {
 // batch is a write-only leveldb batch that commits changes to its host database
 // when Write is called. A batch cannot be used concurrently.
 type batch struct {
-	db   *leveldb.DB
-	b    *leveldb.Batch
-	size int
+	db        *leveldb.DB
+	b         *leveldb.Batch
+	size      int
+	id        int32
+	writeToDB bool
 }
 
 // Put inserts the given value into the batch for later committing.
@@ -497,13 +507,38 @@ func (b *batch) ValueSize() int {
 
 // Write flushes any accumulated data to disk.
 func (b *batch) Write() error {
-	return b.db.Write(b.b, nil)
+	if b.writeToDB {
+		return b.db.Write(b.b, nil)
+	} else {
+		if repl.Cfg.IsWriter {
+			newBatch := &batch{
+				db:        b.db,
+				b:         new(leveldb.Batch),
+				id:        b.id,
+				writeToDB: true,
+			}
+			buf := b.Dump()
+			tmp := make([]byte, len(buf))
+			copy(tmp, buf)
+			newBatch.Load(tmp)
+			repl.Writer.AppendBatch(rdb.BatchWithID{ID: b.id, B: newBatch})
+		}
+		return nil
+	}
 }
 
 // Reset resets the batch for reuse.
 func (b *batch) Reset() {
 	b.b.Reset()
 	b.size = 0
+}
+
+func (b *batch) Load(data []byte) error {
+	return b.b.Load(data)
+}
+
+func (b *batch) Dump() []byte {
+	return b.b.Dump()
 }
 
 // Replay replays the batch contents.

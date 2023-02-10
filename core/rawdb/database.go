@@ -31,6 +31,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/repl"
 	"github.com/olekukonko/tablewriter"
 )
 
@@ -314,12 +315,19 @@ func NewMemoryDatabaseWithCap(size int) ethdb.Database {
 // NewLevelDBDatabase creates a persistent key-value database without a freezer
 // moving immutable chain segments into cold storage.
 func NewLevelDBDatabase(file string, cache int, handles int, namespace string, readonly bool) (ethdb.Database, error) {
-	db, err := leveldb.New(file, cache, handles, namespace, readonly)
-	if err != nil {
-		return nil, err
+	if !repl.Cfg.IsWriter {
+		db, err := ethdb.RemoteDB(file)
+		if err != nil {
+			return nil, err
+		}
+		return NewDatabase(db), nil
+	} else {
+		kvdb, err := leveldb.New(file, cache, handles, namespace, readonly)
+		if err != nil {
+			return nil, err
+		}
+		return NewDatabase(kvdb), nil
 	}
-	log.Info("Using LevelDB as the backing database")
-	return NewDatabase(db), nil
 }
 
 const (

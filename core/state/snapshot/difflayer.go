@@ -102,6 +102,8 @@ type diffLayer struct {
 	parent snapshot   // Parent snapshot modified by this one, never nil
 	memory uint64     // Approximate guess as to how much memory we use
 
+	mergeLayers uint64 // Number of layers to merge before flushing to disk
+
 	root  common.Hash // Root hash to which this snapshot diff belongs to
 	stale atomic.Bool // Signals that the layer became stale (state progressed)
 
@@ -206,6 +208,7 @@ func newDiffLayer(parent snapshot, root common.Hash, destructs map[common.Hash]s
 		}
 	}
 	dl.memory += uint64(len(destructs) * common.HashLength)
+	dl.mergeLayers = 1
 	return dl
 }
 
@@ -221,6 +224,10 @@ func (dl *diffLayer) rebloom(origin *diskLayer) {
 
 	// Inject the new origin that triggered the rebloom
 	dl.origin = origin
+
+	if dl.parent != nil && dl.parent.Root() == origin.root {
+		dl.parent = origin
+	}
 
 	// Retrieve the parent bloom or create a fresh empty one
 	if parent, ok := dl.parent.(*diffLayer); ok {
@@ -485,6 +492,7 @@ func (dl *diffLayer) flatten() snapshot {
 		storageList: make(map[common.Hash][]common.Hash),
 		diffed:      dl.diffed,
 		memory:      parent.memory + dl.memory,
+		mergeLayers: parent.mergeLayers + dl.mergeLayers,
 	}
 }
 

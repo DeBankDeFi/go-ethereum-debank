@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/gasprice"
 	"github.com/ethereum/go-ethereum/miner"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/repl"
 )
 
 // MarshalTOML marshals as TOML.
@@ -61,6 +62,8 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		Checkpoint              *params.TrustedCheckpoint      `toml:",omitempty"`
 		CheckpointOracle        *params.CheckpointOracleConfig `toml:",omitempty"`
 		OverrideShanghai        *uint64                        `toml:",omitempty"`
+
+		Rpl 				    repl.Config
 	}
 	var enc Config
 	enc.Genesis = c.Genesis
@@ -106,6 +109,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.Checkpoint = c.Checkpoint
 	enc.CheckpointOracle = c.CheckpointOracle
 	enc.OverrideShanghai = c.OverrideShanghai
+	enc.Rpl = c.Rpl
 	return &enc, nil
 }
 
@@ -155,6 +159,7 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		Checkpoint              *params.TrustedCheckpoint      `toml:",omitempty"`
 		CheckpointOracle        *params.CheckpointOracleConfig `toml:",omitempty"`
 		OverrideShanghai        *uint64                        `toml:",omitempty"`
+		Rpl 				   	*repl.Config
 	}
 	var dec Config
 	if err := unmarshal(&dec); err != nil {
@@ -288,6 +293,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.OverrideShanghai != nil {
 		c.OverrideShanghai = dec.OverrideShanghai
+	}
+	if dec.Rpl != nil {
+		c.Rpl = *dec.Rpl
 	}
 	return nil
 }

@@ -39,6 +39,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/node"
+	"github.com/ethereum/go-ethereum/repl"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/urfave/cli/v2"
 )
@@ -117,6 +118,18 @@ Optional second and third arguments control the first and
 last block to write. In this mode, the file will be appended
 if already existing. If the file ends with .gz, the output will
 be gzipped.`,
+	}
+	repairCommand = &cli.Command{
+		Action:    repairChain,
+		Name:      "repair",
+		Usage:     "repair blockchain",
+		ArgsUsage: "",
+		Flags: flags.Merge([]cli.Flag{
+			utils.CacheFlag,
+			utils.SyncModeFlag,
+		}, utils.DatabasePathFlags),
+		Description: `
+Repair the blockchain database.`,
 	}
 	importPreimagesCommand = &cli.Command{
 		Action:    importPreimages,
@@ -322,6 +335,25 @@ func importChain(ctx *cli.Context) error {
 
 	showLeveldbStats(db)
 	return importErr
+}
+
+func repairChain(ctx *cli.Context) error {
+	stack, _ := makeConfigNode(ctx)
+	defer stack.Close()
+
+	repl.Cfg = &repl.Config{
+		IsWriter: true,
+	}
+	err := repl.InitreplWriter()
+	if err != nil {
+		utils.Fatalf("InitreplWriter %v", err)
+		return err
+	}
+
+	chain, _ := utils.MakeChain(ctx, stack, false)
+	chain.Stop()
+	fmt.Printf("Repairing chain at %s\n", chain.CurrentBlock().Hash().Hex())
+	return nil
 }
 
 func exportChain(ctx *cli.Context) error {

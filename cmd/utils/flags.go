@@ -2297,13 +2297,9 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 		cache.Preimages = true
 		log.Info("Enabling recording of key preimages since archive mode is used")
 	}
-	if !ctx.Bool(SnapshotFlag.Name) {
-		cache.SnapshotLimit = 0 // Disabled
-	}
+	cache.SnapshotLimit = 0 // Disabled
 	// If we're in readonly, do not bother generating snapshot data.
-	if readonly {
-		cache.SnapshotNoBuild = true
-	}
+	cache.SnapshotNoBuild = true
 
 	if ctx.IsSet(CacheFlag.Name) || ctx.IsSet(CacheTrieFlag.Name) {
 		cache.TrieCleanLimit = ctx.Int(CacheFlag.Name) * ctx.Int(CacheTrieFlag.Name) / 100
