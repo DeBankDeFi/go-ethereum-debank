@@ -51,7 +51,7 @@ import (
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/txtrace"
 
-	"github.com/DeBankDeFi/db-replicator/pkg/reader"
+	"github.com/DeBankDeFi/nodex/pkg/reader"
 )
 
 var (

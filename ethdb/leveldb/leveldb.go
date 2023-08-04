@@ -27,7 +27,7 @@ import (
 	"sync"
 	"time"
 
-	rdb "github.com/DeBankDeFi/db-replicator/pkg/db"
+	rdb "github.com/DeBankDeFi/nodex/pkg/db"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"

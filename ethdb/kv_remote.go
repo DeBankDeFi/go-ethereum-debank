@@ -3,7 +3,7 @@ package ethdb
 import (
 	"fmt"
 
-	"github.com/DeBankDeFi/db-replicator/pkg/reader"
+	"github.com/DeBankDeFi/nodex/pkg/reader"
 	"github.com/ethereum/go-ethereum/repl"
 )
 

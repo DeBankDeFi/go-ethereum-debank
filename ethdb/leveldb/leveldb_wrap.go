@@ -1,7 +1,7 @@
 package leveldb
 
 import (
-	rdb "github.com/DeBankDeFi/db-replicator/pkg/db"
+	rdb "github.com/DeBankDeFi/nodex/pkg/db"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/util"
 )

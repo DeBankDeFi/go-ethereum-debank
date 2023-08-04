@@ -4,8 +4,8 @@ import (
 	"sync"
 	"time"
 
-	rpb "github.com/DeBankDeFi/db-replicator/pkg/pb"
-	rreader "github.com/DeBankDeFi/db-replicator/pkg/reader"
+	rpb "github.com/DeBankDeFi/nodex/pkg/pb"
+	rreader "github.com/DeBankDeFi/nodex/pkg/reader"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"

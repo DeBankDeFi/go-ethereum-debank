@@ -3,9 +3,9 @@ package repl
 import (
 	"sync"
 
-	rdb "github.com/DeBankDeFi/db-replicator/pkg/db"
-	rutils "github.com/DeBankDeFi/db-replicator/pkg/utils"
-	rwriter "github.com/DeBankDeFi/db-replicator/pkg/writer"
+	rdb "github.com/DeBankDeFi/nodex/pkg/db"
+	rutils "github.com/DeBankDeFi/nodex/pkg/utils"
+	rwriter "github.com/DeBankDeFi/nodex/pkg/writer"
 	"github.com/ethereum/go-ethereum/log"
 )
 
