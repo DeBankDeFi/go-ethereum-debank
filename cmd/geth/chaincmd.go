@@ -164,6 +164,24 @@ It's deprecated, please use "geth db export" instead.
 This command dumps out the state for a given block (or latest, if none provided).
 `,
 	}
+	dumpCommand2 = &cli.Command{
+		Action:    dump2,
+		Name:      "dump2",
+		Usage:     "Dump a specific block from storage",
+		ArgsUsage: "[? <blockHash> | <blockNum>]",
+		Flags: flags.Merge([]cli.Flag{
+			utils.DumpDBFlag,
+			utils.CacheFlag,
+			utils.ExcludeCodeFlag,
+			utils.ExcludeStorageFlag,
+			utils.IncludeIncompletesFlag,
+			utils.StartKeyFlag,
+			utils.DumpLimitFlag,
+		}, utils.DatabasePathFlags),
+		Description: `
+This command dumps out the state for a given block (or latest, if none provided).
+`,
+	}
 )
 
 // initGenesis will initialise the given JSON format genesis file and writes it as
@@ -399,11 +417,11 @@ func exportPreimages(ctx *cli.Context) error {
 	return nil
 }
 
-func parseDumpConfig(ctx *cli.Context, stack *node.Node) (*state.DumpConfig, ethdb.Database, common.Hash, error) {
+func parseDumpConfig(ctx *cli.Context, stack *node.Node) (*state.DumpConfig, ethdb.Database, common.Hash, *types.Block, error) {
 	db := utils.MakeChainDatabase(ctx, stack, true)
 	var header *types.Header
 	if ctx.NArg() > 1 {
-		return nil, nil, common.Hash{}, fmt.Errorf("expected 1 argument (number or hash), got %d", ctx.NArg())
+		return nil, nil, common.Hash{}, nil, fmt.Errorf("expected 1 argument (number or hash), got %d", ctx.NArg())
 	}
 	if ctx.NArg() == 1 {
 		arg := ctx.Args().First()
@@ -412,17 +430,17 @@ func parseDumpConfig(ctx *cli.Context, stack *node.Node) (*state.DumpConfig, eth
 			if number := rawdb.ReadHeaderNumber(db, hash); number != nil {
 				header = rawdb.ReadHeader(db, hash, *number)
 			} else {
-				return nil, nil, common.Hash{}, fmt.Errorf("block %x not found", hash)
+				return nil, nil, common.Hash{}, nil, fmt.Errorf("block %x not found", hash)
 			}
 		} else {
 			number, err := strconv.ParseUint(arg, 10, 64)
 			if err != nil {
-				return nil, nil, common.Hash{}, err
+				return nil, nil, common.Hash{}, nil, err
 			}
 			if hash := rawdb.ReadCanonicalHash(db, number); hash != (common.Hash{}) {
 				header = rawdb.ReadHeader(db, hash, number)
 			} else {
-				return nil, nil, common.Hash{}, fmt.Errorf("header for block %d not found", number)
+				return nil, nil, common.Hash{}, nil, fmt.Errorf("header for block %d not found", number)
 			}
 		}
 	} else {
@@ -430,8 +448,9 @@ func parseDumpConfig(ctx *cli.Context, stack *node.Node) (*state.DumpConfig, eth
 		header = rawdb.ReadHeadHeader(db)
 	}
 	if header == nil {
-		return nil, nil, common.Hash{}, errors.New("no head block found")
+		return nil, nil, common.Hash{}, nil, errors.New("no head block found")
 	}
+	block := rawdb.ReadBlock(db, header.Hash(), header.Number.Uint64())
 	startArg := common.FromHex(ctx.String(utils.StartKeyFlag.Name))
 	var start common.Hash
 	switch len(startArg) {
@@ -442,26 +461,27 @@ func parseDumpConfig(ctx *cli.Context, stack *node.Node) (*state.DumpConfig, eth
 		start = crypto.Keccak256Hash(startArg)
 		log.Info("Converting start-address to hash", "address", common.BytesToAddress(startArg), "hash", start.Hex())
 	default:
-		return nil, nil, common.Hash{}, fmt.Errorf("invalid start argument: %x. 20 or 32 hex-encoded bytes required", startArg)
+		start = common.Hash{}
 	}
 	var conf = &state.DumpConfig{
-		SkipCode:          ctx.Bool(utils.ExcludeCodeFlag.Name),
-		SkipStorage:       ctx.Bool(utils.ExcludeStorageFlag.Name),
-		OnlyWithAddresses: !ctx.Bool(utils.IncludeIncompletesFlag.Name),
+		Dir:               ctx.String(utils.DumpDBFlag.Name),
+		SkipCode:          false,
+		SkipStorage:       false,
+		OnlyWithAddresses: false,
 		Start:             start.Bytes(),
 		Max:               ctx.Uint64(utils.DumpLimitFlag.Name),
 	}
 	log.Info("State dump configured", "block", header.Number, "hash", header.Hash().Hex(),
 		"skipcode", conf.SkipCode, "skipstorage", conf.SkipStorage,
 		"start", hexutil.Encode(conf.Start), "limit", conf.Max)
-	return conf, db, header.Root, nil
+	return conf, db, block.Root(), block, nil
 }
 
 func dump(ctx *cli.Context) error {
 	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
-	conf, db, root, err := parseDumpConfig(ctx, stack)
+	conf, db, root, _, err := parseDumpConfig(ctx, stack)
 	if err != nil {
 		return err
 	}
@@ -481,6 +501,47 @@ func dump(ctx *cli.Context) error {
 			return fmt.Errorf("incompatible options")
 		}
 		fmt.Println(string(state.Dump(conf)))
+	}
+	return nil
+}
+
+func dump2(ctx *cli.Context) error {
+	stack, _ := makeConfigNode(ctx)
+	defer stack.Close()
+
+	conf, db, root, block, err := parseDumpConfig(ctx, stack)
+	if err != nil {
+		return err
+	}
+	config := &trie.Config{
+		Preimages: true, // always enable preimage lookup
+	}
+	state, err := state.New(root, state.NewDatabaseWithConfig(db, config), nil)
+	if err != nil {
+		return err
+	}
+	os.MkdirAll(conf.Dir+"/lastest_block_info", 0755)
+	rpcBlock, err := rpcMarshalBlock(db, block, true, true)
+	if err != nil {
+		log.Error("Failed to marshal block", "err", err)
+		return err
+	}
+	log.Info("Dumping block info", "block", block.Number, "hash", block.Hash)
+	rawbytes, err := json.Marshal(rpcBlock)
+	if err != nil {
+		log.Error("Failed to encode block info", "err", err)
+		return err
+	}
+	err = os.WriteFile(conf.Dir+"/lastest_block_info/1.rlp", rawbytes, 0644)
+	if err != nil {
+		log.Error("Failed to write block info", "err", err)
+		return err
+	}
+
+	err = state.DumpToFile(conf)
+	if err != nil {
+		log.Error("Failed to dump state", "err", err)
+		return err
 	}
 	return nil
 }

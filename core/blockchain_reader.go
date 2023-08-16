@@ -272,6 +272,14 @@ func (bc *BlockChain) GetTd(hash common.Hash, number uint64) *big.Int {
 	return bc.hc.GetTd(hash, number)
 }
 
+func (bc *BlockChain) GetBlockStorageDiff(root common.Hash) *types.BlockStorageDiff {
+	return rawdb.ReadBlockStorageDiff(bc.db, root)
+}
+
+func (bc *BlockChain) GetBlockStorageDiffRLP(root common.Hash) []byte {
+	return rawdb.ReadBlockStorageDiffRLP(bc.db, root)
+}
+
 // HasState checks if state trie is fully present in the database or not.
 func (bc *BlockChain) HasState(hash common.Hash) bool {
 	_, err := bc.stateCache.OpenTrie(hash)

@@ -361,6 +361,11 @@ func (s *Ethereum) APIs() []rpc.API {
 			Version:   "1.0",
 			Service:   NewPublicTxTraceAPI(s),
 			Public:    true,
+		}, {
+			Namespace: "leafage",
+			Version:   "1.0",
+			Service:   NewPublicLeafAgeAPI(s),
+			Public:    true,
 		},
 	}...)
 }

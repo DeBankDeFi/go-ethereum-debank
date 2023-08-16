@@ -20,21 +20,29 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math/big"
 	"os"
 	"time"
 
 	"github.com/ethereum/go-ethereum/cmd/utils"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/state/pruner"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/internal/ethapi"
 	"github.com/ethereum/go-ethereum/internal/flags"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
+	"github.com/holiman/uint256"
 	cli "github.com/urfave/cli/v2"
 )
 
@@ -140,6 +148,27 @@ It's also usable without snapshot enabled.
 				ArgsUsage: "[? <blockHash> | <blockNum>]",
 				Action:    dumpState,
 				Flags: flags.Merge([]cli.Flag{
+					utils.DumpDBFlag,
+					utils.ExcludeCodeFlag,
+					utils.ExcludeStorageFlag,
+					utils.StartKeyFlag,
+					utils.DumpLimitFlag,
+				}, utils.NetworkFlags, utils.DatabasePathFlags),
+				Description: `
+This command is semantically equivalent to 'geth dump', but uses the snapshots
+as the backend data source, making this command a lot faster. 
+
+The argument is interpreted as block number or hash. If none is provided, the latest
+block is used.
+`,
+			},
+			{
+				Name:      "dump2",
+				Usage:     "Dump a specific block from storage (same as 'geth dump' but using snapshots)",
+				ArgsUsage: "[? <blockHash> | <blockNum>]",
+				Action:    dumpState2,
+				Flags: flags.Merge([]cli.Flag{
+					utils.DumpDBFlag,
 					utils.ExcludeCodeFlag,
 					utils.ExcludeStorageFlag,
 					utils.StartKeyFlag,
@@ -486,7 +515,7 @@ func dumpState(ctx *cli.Context) error {
 	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
-	conf, db, root, err := parseDumpConfig(ctx, stack)
+	conf, db, root, _, err := parseDumpConfig(ctx, stack)
 	if err != nil {
 		return err
 	}
@@ -587,5 +616,355 @@ func checkAccount(ctx *cli.Context) error {
 		return err
 	}
 	log.Info("Checked the snapshot journalled storage", "time", common.PrettyDuration(time.Since(start)))
+	return nil
+}
+
+// RPCMarshalHeader converts the given header to the RPC output .
+func RPCMarshalHeader(head *types.Header) map[string]interface{} {
+	result := map[string]interface{}{
+		"number":           (*hexutil.Big)(head.Number),
+		"hash":             head.Hash(),
+		"parentHash":       head.ParentHash,
+		"nonce":            head.Nonce,
+		"mixHash":          head.MixDigest,
+		"sha3Uncles":       head.UncleHash,
+		"logsBloom":        head.Bloom,
+		"stateRoot":        head.Root,
+		"miner":            head.Coinbase,
+		"difficulty":       (*hexutil.Big)(head.Difficulty),
+		"extraData":        hexutil.Bytes(head.Extra),
+		"size":             hexutil.Uint64(head.Size()),
+		"gasLimit":         hexutil.Uint64(head.GasLimit),
+		"gasUsed":          hexutil.Uint64(head.GasUsed),
+		"timestamp":        hexutil.Uint64(head.Time),
+		"transactionsRoot": head.TxHash,
+		"receiptsRoot":     head.ReceiptHash,
+	}
+
+	if head.BaseFee != nil {
+		result["baseFeePerGas"] = (*hexutil.Big)(head.BaseFee)
+	}
+
+	if head.WithdrawalsHash != nil {
+		result["withdrawalsRoot"] = head.WithdrawalsHash
+	}
+
+	return result
+}
+
+// newRPCTransaction returns a transaction that will serialize to the RPC
+// representation, with the given location metadata set (if available).
+func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber uint64, index uint64, baseFee *big.Int, config *params.ChainConfig) *ethapi.RPCTransaction {
+	signer := types.MakeSigner(config, new(big.Int).SetUint64(blockNumber))
+	from, _ := types.Sender(signer, tx)
+	v, r, s := tx.RawSignatureValues()
+	result := &ethapi.RPCTransaction{
+		Type:     hexutil.Uint64(tx.Type()),
+		From:     from,
+		Gas:      hexutil.Uint64(tx.Gas()),
+		GasPrice: (*hexutil.Big)(tx.GasPrice()),
+		Hash:     tx.Hash(),
+		Input:    hexutil.Bytes(tx.Data()),
+		Nonce:    hexutil.Uint64(tx.Nonce()),
+		To:       tx.To(),
+		Value:    (*hexutil.Big)(tx.Value()),
+		V:        (*hexutil.Big)(v),
+		R:        (*hexutil.Big)(r),
+		S:        (*hexutil.Big)(s),
+	}
+	if blockHash != (common.Hash{}) {
+		result.BlockHash = &blockHash
+		result.BlockNumber = (*hexutil.Big)(new(big.Int).SetUint64(blockNumber))
+		result.TransactionIndex = (*hexutil.Uint64)(&index)
+	}
+	switch tx.Type() {
+	case types.LegacyTxType:
+		// if a legacy transaction has an EIP-155 chain id, include it explicitly
+		if id := tx.ChainId(); id.Sign() != 0 {
+			result.ChainID = (*hexutil.Big)(id)
+		}
+	case types.AccessListTxType:
+		al := tx.AccessList()
+		result.Accesses = &al
+		result.ChainID = (*hexutil.Big)(tx.ChainId())
+	case types.DynamicFeeTxType:
+		al := tx.AccessList()
+		result.Accesses = &al
+		result.ChainID = (*hexutil.Big)(tx.ChainId())
+		result.GasFeeCap = (*hexutil.Big)(tx.GasFeeCap())
+		result.GasTipCap = (*hexutil.Big)(tx.GasTipCap())
+		// if the transaction has been mined, compute the effective gas price
+		if baseFee != nil && blockHash != (common.Hash{}) {
+			// price = min(tip, gasFeeCap - baseFee) + baseFee
+			price := math.BigMin(new(big.Int).Add(tx.GasTipCap(), baseFee), tx.GasFeeCap())
+			result.GasPrice = (*hexutil.Big)(price)
+		} else {
+			result.GasPrice = (*hexutil.Big)(tx.GasFeeCap())
+		}
+	}
+	return result
+}
+
+// newRPCTransactionFromBlockIndex returns a transaction that will serialize to the RPC representation.
+func newRPCTransactionFromBlockIndex(b *types.Block, index uint64, config *params.ChainConfig) *ethapi.RPCTransaction {
+	txs := b.Transactions()
+	if index >= uint64(len(txs)) {
+		return nil
+	}
+	return newRPCTransaction(txs[index], b.Hash(), b.NumberU64(), index, b.BaseFee(), config)
+}
+
+// newRPCTransactionFromBlockHash returns a transaction that will serialize to the RPC representation.
+func newRPCTransactionFromBlockHash(b *types.Block, hash common.Hash, config *params.ChainConfig) *ethapi.RPCTransaction {
+	for idx, tx := range b.Transactions() {
+		if tx.Hash() == hash {
+			return newRPCTransactionFromBlockIndex(b, uint64(idx), config)
+		}
+	}
+	return nil
+}
+
+func RPCMarshalBlock(block *types.Block, inclTx bool, fullTx bool, config *params.ChainConfig) (map[string]interface{}, error) {
+	fields := RPCMarshalHeader(block.Header())
+	fields["size"] = hexutil.Uint64(block.Size())
+
+	if inclTx {
+		formatTx := func(tx *types.Transaction) (interface{}, error) {
+			return tx.Hash(), nil
+		}
+		if fullTx {
+			formatTx = func(tx *types.Transaction) (interface{}, error) {
+				return newRPCTransactionFromBlockHash(block, tx.Hash(), config), nil
+			}
+		}
+		txs := block.Transactions()
+		transactions := make([]interface{}, len(txs))
+		var err error
+		for i, tx := range txs {
+			if transactions[i], err = formatTx(tx); err != nil {
+				return nil, err
+			}
+		}
+		fields["transactions"] = transactions
+	}
+	uncles := block.Uncles()
+	uncleHashes := make([]common.Hash, len(uncles))
+	for i, uncle := range uncles {
+		uncleHashes[i] = uncle.Hash()
+	}
+	fields["uncles"] = uncleHashes
+	if block.Header().WithdrawalsHash != nil {
+		fields["withdrawals"] = block.Withdrawals()
+	}
+	return fields, nil
+}
+
+func rpcMarshalBlock(db ethdb.Database, b *types.Block, inclTx bool, fullTx bool) (map[string]interface{}, error) {
+	stored := rawdb.ReadCanonicalHash(db, 0)
+	if (stored == common.Hash{}) {
+		return nil, fmt.Errorf("invalid genesis hash in database: %x", stored)
+	}
+	config := rawdb.ReadChainConfig(db, stored)
+	if config == nil {
+		return nil, fmt.Errorf("genesis config missing from db")
+	}
+	fields, err := RPCMarshalBlock(b, inclTx, fullTx, config)
+	if err != nil {
+		return nil, err
+	}
+	if inclTx {
+		td := rawdb.ReadTd(db, b.Hash(), b.NumberU64())
+		fields["totalDifficulty"] = (*hexutil.Big)(td)
+	}
+	return fields, err
+}
+
+func dumpState2(ctx *cli.Context) error {
+	stack, _ := makeConfigNode(ctx)
+	defer stack.Close()
+
+	conf, db, root, block, err := parseDumpConfig(ctx, stack)
+	if err != nil {
+		return err
+	}
+	snapConfig := snapshot.Config{
+		CacheSize:  256,
+		Recovery:   false,
+		NoBuild:    true,
+		AsyncBuild: false,
+	}
+	snaptree, err := snapshot.New(snapConfig, db, trie.NewDatabase(db), root)
+	if err != nil {
+		return err
+	}
+	accIt, err := snaptree.AccountIterator(root, common.BytesToHash(conf.Start))
+	if err != nil {
+		return err
+	}
+	defer accIt.Release()
+	log.Info("Dumping block info", "block", block.Number, "hash", block.Hash)
+	log.Info("Snapshot dumping started", "root", root)
+	os.MkdirAll(conf.Dir+"/lastest_block_info", 0755)
+	os.MkdirAll(conf.Dir+"/accounts", 0755)
+	os.MkdirAll(conf.Dir+"/codes", 0755)
+	os.MkdirAll(conf.Dir+"/storages", 0755)
+	rpcBlock, err := rpcMarshalBlock(db, block, true, true)
+	if err != nil {
+		log.Error("Failed to marshal block", "err", err)
+		return err
+	}
+	rawbytes, err := json.Marshal(rpcBlock)
+	if err != nil {
+		log.Error("Failed to encode block info", "err", err)
+		return err
+	}
+	err = os.WriteFile(conf.Dir+"/lastest_block_info/1.rlp", rawbytes, 0644)
+	if err != nil {
+		log.Error("Failed to write block info", "err", err)
+		return err
+	}
+	var (
+		start        = time.Now()
+		logged       = time.Now()
+		accounts     = make([]*state.SimpleAccount, 0)
+		accountCount = 0
+		codeMap      = make(map[common.Hash]bool)
+		codes        = make([]*state.SimpleCode, 0)
+		codesCount   = 0
+		storages     = make([]*state.SimpleKeyValue, 0)
+		storageCount = 0
+	)
+	for accIt.Next() {
+		account, err := snapshot.FullAccount(accIt.Account())
+		if err != nil {
+			return err
+		}
+		balance, _ := uint256.FromBig(account.Balance)
+		da := &state.SimpleAccount{
+			Address:  accIt.Hash(),
+			Balance:  balance,
+			Nonce:    account.Nonce,
+			CodeHash: common.BytesToHash(account.CodeHash),
+		}
+		accounts = append(accounts, da)
+		accountCount += 1
+		if len(accounts) >= 100000 {
+			rawbytes, err := rlp.EncodeToBytes(accounts)
+			if err != nil {
+				log.Error("Failed to encode accounts", "err", err)
+				return err
+			}
+			log.Info("write account", "accountCount", accountCount)
+			err = os.WriteFile(fmt.Sprintf("%s/accounts/%d.rlp", conf.Dir, accountCount), rawbytes, 0644)
+			if err != nil {
+				log.Error("Failed to write accounts", "err", err)
+				return err
+			}
+			accounts = make([]*state.SimpleAccount, 0)
+		}
+
+		if !bytes.Equal(account.CodeHash, types.EmptyCodeHash.Bytes()) {
+			if _, ok := codeMap[common.BytesToHash(account.CodeHash)]; !ok {
+				code := rawdb.ReadCode(db, common.BytesToHash(account.CodeHash))
+				codes = append(codes, &state.SimpleCode{
+					CodeHash: common.BytesToHash(account.CodeHash),
+					Code:     code,
+				})
+				codeMap[common.BytesToHash(account.CodeHash)] = true
+				codesCount += 1
+				if len(codes) >= 10000 {
+					rawbytes, err := rlp.EncodeToBytes(codes)
+					if err != nil {
+						log.Error("Failed to encode codes", "err", err)
+						return err
+					}
+					log.Info("write code", "codesCount", codesCount)
+					err = os.WriteFile(fmt.Sprintf("%s/codes/%d.rlp", conf.Dir, codesCount), rawbytes, 0644)
+					if err != nil {
+						log.Error("Failed to write codes", "err", err)
+						return err
+					}
+					codes = make([]*state.SimpleCode, 0)
+				}
+			}
+		}
+		stIt, err := snaptree.StorageIterator(root, accIt.Hash(), common.Hash{})
+		if err != nil {
+			return err
+		}
+		for stIt.Next() {
+			_, content, _, err := rlp.Split(stIt.Slot())
+			if err != nil {
+				log.Error("Failed to split storage", "err", err)
+				return err
+			}
+			valueHash := common.BytesToHash(content)
+			value := uint256.NewInt(0).SetBytes(valueHash.Bytes())
+			storages = append(storages, &state.SimpleKeyValue{
+				Address: da.Address,
+				Index:   stIt.Hash(),
+				Value:   value,
+			})
+			storageCount += 1
+			if len(storages) >= 100000 {
+				rawbytes, err := rlp.EncodeToBytes(storages)
+				if err != nil {
+					log.Error("Failed to encode storages", "err", err)
+					return err
+				}
+				log.Info("write storage", "storageCount", storageCount)
+				err = os.WriteFile(fmt.Sprintf("%s/storages/%d.rlp", conf.Dir, storageCount), rawbytes, 0644)
+				if err != nil {
+					log.Error("Failed to write storages", "err", err)
+					return err
+				}
+				storages = make([]*state.SimpleKeyValue, 0)
+			}
+			if time.Since(logged) > 8*time.Second {
+				log.Info("Snapshot dumping in progress", "at", accIt.Hash(), "accounts", accountCount, "codes", codesCount, "storages", storageCount,
+					"elapsed", common.PrettyDuration(time.Since(start)))
+				logged = time.Now()
+			}
+		}
+	}
+	if len(accounts) > 0 {
+		rawbytes, err := rlp.EncodeToBytes(accounts)
+		if err != nil {
+			log.Error("Failed to encode accounts", "err", err)
+			return err
+		}
+		log.Info("write account", "accountCount", accountCount)
+		err = os.WriteFile(fmt.Sprintf("%s/accounts/%d.rlp", conf.Dir, accountCount), rawbytes, 0644)
+		if err != nil {
+			log.Error("Failed to write accounts", "err", err)
+			return err
+		}
+	}
+	if len(codes) > 0 {
+		rawbytes, err := rlp.EncodeToBytes(codes)
+		if err != nil {
+			log.Error("Failed to encode codes", "err", err)
+			return err
+		}
+		log.Info("write code", "codesCount", codesCount)
+		err = os.WriteFile(fmt.Sprintf("%s/codes/%d.rlp", conf.Dir, codesCount), rawbytes, 0644)
+		if err != nil {
+			log.Error("Failed to write codes", "err", err)
+			return err
+		}
+	}
+	if len(storages) > 0 {
+		rawbytes, err := rlp.EncodeToBytes(storages)
+		if err != nil {
+			log.Error("Failed to encode storages", "err", err)
+			return err
+		}
+		log.Info("write storage", "storageCount", storageCount)
+		err = os.WriteFile(fmt.Sprintf("%s/storages/%d.rlp", conf.Dir, storageCount), rawbytes, 0644)
+		if err != nil {
+			log.Error("Failed to write storages", "err", err)
+			return err
+		}
+	}
 	return nil
 }

@@ -34,6 +34,7 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
+	"github.com/holiman/uint256"
 )
 
 type revision struct {
@@ -71,6 +72,7 @@ type StateDB struct {
 	snap         snapshot.Snapshot
 	snapAccounts map[common.Hash][]byte
 	snapStorage  map[common.Hash]map[common.Hash][]byte
+	codes        map[common.Hash][]byte
 
 	// This map holds 'live' objects, which will get modified while processing a state transition.
 	stateObjects         map[common.Address]*stateObject
@@ -151,12 +153,9 @@ func New(root common.Hash, db Database, snaps *snapshot.Tree) (*StateDB, error) 
 		transientStorage:     newTransientStorage(),
 		hasher:               crypto.NewKeccakState(),
 	}
-	if sdb.snaps != nil {
-		if sdb.snap = sdb.snaps.Snapshot(root); sdb.snap != nil {
-			sdb.snapAccounts = make(map[common.Hash][]byte)
-			sdb.snapStorage = make(map[common.Hash]map[common.Hash][]byte)
-		}
-	}
+	sdb.snapAccounts = make(map[common.Hash][]byte)
+	sdb.snapStorage = make(map[common.Hash]map[common.Hash][]byte)
+	sdb.codes = make(map[common.Hash][]byte)
 	return sdb, nil
 }
 
@@ -520,9 +519,7 @@ func (s *StateDB) updateStateObject(obj *stateObject) {
 	// update mechanism is not symmetric to the deletion, because whereas it is
 	// enough to track account updates at commit time, deletions need tracking
 	// at transaction boundary level to ensure we capture state clearing.
-	if s.snap != nil {
-		s.snapAccounts[obj.addrHash] = snapshot.SlimAccountRLP(obj.data.Nonce, obj.data.Balance, obj.data.Root, obj.data.CodeHash)
-	}
+	s.snapAccounts[obj.addrHash] = snapshot.SlimAccountRLP(obj.data.Nonce, obj.data.Balance, obj.data.Root, obj.data.CodeHash)
 }
 
 // deleteStateObject removes the given object from the state trie.
@@ -774,27 +771,25 @@ func (s *StateDB) Copy() *StateDB {
 	if s.prefetcher != nil {
 		state.prefetcher = s.prefetcher.copy()
 	}
-	if s.snaps != nil {
-		// In order for the miner to be able to use and make additions
-		// to the snapshot tree, we need to copy that as well.
-		// Otherwise, any block mined by ourselves will cause gaps in the tree,
-		// and force the miner to operate trie-backed only
-		state.snaps = s.snaps
-		state.snap = s.snap
+	// In order for the miner to be able to use and make additions
+	// to the snapshot tree, we need to copy that as well.
+	// Otherwise, any block mined by ourselves will cause gaps in the tree,
+	// and force the miner to operate trie-backed only
+	state.snaps = s.snaps
+	state.snap = s.snap
 
-		// deep copy needed
-		state.snapAccounts = make(map[common.Hash][]byte)
-		for k, v := range s.snapAccounts {
-			state.snapAccounts[k] = v
+	// deep copy needed
+	state.snapAccounts = make(map[common.Hash][]byte)
+	for k, v := range s.snapAccounts {
+		state.snapAccounts[k] = v
+	}
+	state.snapStorage = make(map[common.Hash]map[common.Hash][]byte)
+	for k, v := range s.snapStorage {
+		temp := make(map[common.Hash][]byte)
+		for kk, vv := range v {
+			temp[kk] = vv
 		}
-		state.snapStorage = make(map[common.Hash]map[common.Hash][]byte)
-		for k, v := range s.snapStorage {
-			temp := make(map[common.Hash][]byte)
-			for kk, vv := range v {
-				temp[kk] = vv
-			}
-			state.snapStorage[k] = temp
-		}
+		state.snapStorage[k] = temp
 	}
 	return state
 }
@@ -855,10 +850,8 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 			// Note, we can't do this only at the end of a block because multiple
 			// transactions within the same block might self destruct and then
 			// resurrect an account; but the snapshotter needs both events.
-			if s.snap != nil {
-				delete(s.snapAccounts, obj.addrHash) // Clear out any previously updated account data (may be recreated via a resurrect)
-				delete(s.snapStorage, obj.addrHash)  // Clear out any previously updated storage data (may be recreated via a resurrect)
-			}
+			delete(s.snapAccounts, obj.addrHash) // Clear out any previously updated account data (may be recreated via a resurrect)
+			delete(s.snapStorage, obj.addrHash)  // Clear out any previously updated storage data (may be recreated via a resurrect)
 		} else {
 			obj.finalise(true) // Prefetch slots in the background
 		}
@@ -979,6 +972,7 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 			// Write any contract code associated with the state object
 			if obj.code != nil && obj.dirtyCode {
 				rawdb.WriteCode(codeWriter, common.BytesToHash(obj.CodeHash()), obj.code)
+				s.codes[common.BytesToHash(obj.CodeHash())] = obj.code
 				obj.dirtyCode = false
 			}
 			// Write any storage changes in the state object to its storage trie
@@ -1039,6 +1033,9 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 		s.StorageUpdated, s.StorageDeleted = 0, 0
 	}
 	// If snapshotting is enabled, update the snapshot tree with this new version
+	blockStorageDiff := s.getStateDiff()
+	rawdb.WriteBlockStorageDiff(s.db.DiskDB(), root, blockStorageDiff)
+	log.Info("Block storage diff written", "root", root)
 	if s.snap != nil {
 		start := time.Now()
 		// Only update if there's a state transition (skip empty Clique blocks)
@@ -1046,6 +1043,7 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 			if err := s.snaps.Update(root, parent, s.convertAccountSet(s.stateObjectsDestruct), s.snapAccounts, s.snapStorage); err != nil {
 				log.Warn("Failed to update snapshot tree", "from", parent, "to", root, "err", err)
 			}
+			log.Info("Snapshot tree updated", "from", parent, "to", root)
 			// Keep 128 diff layers in the memory, persistent layer is 129th.
 			// - head layer is paired with HEAD state
 			// - head-1 layer is paired with HEAD-1 state
@@ -1057,8 +1055,8 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 		if metrics.EnabledExpensive {
 			s.SnapshotCommits += time.Since(start)
 		}
-		s.snap, s.snapAccounts, s.snapStorage = nil, nil, nil
 	}
+	s.snap, s.snapAccounts, s.snapStorage, s.codes = nil, nil, nil, nil
 	if len(s.stateObjectsDestruct) > 0 {
 		s.stateObjectsDestruct = make(map[common.Address]struct{})
 	}
@@ -1170,4 +1168,89 @@ func (s *StateDB) convertAccountSet(set map[common.Address]struct{}) map[common.
 		}
 	}
 	return ret
+}
+
+func (s *StateDB) convertDeletedAccountSet(set map[common.Address]struct{}) []common.Hash {
+	ret := make([]common.Hash, 0, len(set))
+	for addr := range set {
+		obj, exist := s.stateObjects[addr]
+		if !exist {
+			ret = append(ret, crypto.Keccak256Hash(addr[:]))
+		} else {
+			ret = append(ret, obj.addrHash)
+		}
+	}
+	return ret
+}
+
+func (s *StateDB) convertNewAccountSet(accounts map[common.Hash][]byte) []types.NewAccount {
+	ret := make([]types.NewAccount, 0, len(accounts))
+	for hash, data := range accounts {
+		account := new(snapshot.Account)
+		if err := rlp.DecodeBytes(data, account); err != nil {
+			panic(err)
+		}
+		address := hash
+		balance := uint256.MustFromBig(account.Balance)
+		nonce := account.Nonce
+		codeHash := account.CodeHash
+		ret = append(ret, types.NewAccount{
+			Address:  address,
+			Balance:  balance,
+			Nonce:    nonce,
+			CodeHash: common.BytesToHash(codeHash),
+		})
+	}
+	return ret
+}
+
+func (s *StateDB) convertNewStorageSet(storages map[common.Hash]map[common.Hash][]byte) []types.AccountStorageDiff {
+	ret := make([]types.AccountStorageDiff, 0, len(storages))
+	for address, storage := range storages {
+		storageDiff := make([]types.IndexValuePair, 0, len(storage))
+		for slot, data := range storage {
+			value := uint256.NewInt(0)
+			if len(data) > 0 {
+				_, content, _, err := rlp.Split(data)
+				if err != nil {
+					log.Error("Failed to split storage", "err", err)
+				}
+				value = uint256.NewInt(0).SetBytes(content)
+			}
+			storageDiff = append(storageDiff, types.IndexValuePair{
+				Index: slot,
+				Value: value,
+			})
+		}
+		ret = append(ret, types.AccountStorageDiff{
+			Address: address,
+			Values:  storageDiff,
+		})
+	}
+	return ret
+}
+
+func (s *StateDB) convertNewCodeSet(codes map[common.Hash][]byte) []types.NewCode {
+	ret := make([]types.NewCode, 0, len(codes))
+	for codeHash, code := range codes {
+		ret = append(ret, types.NewCode{
+			CodeHash: codeHash,
+			Code:     code,
+		})
+	}
+	return ret
+}
+
+func (s *StateDB) getStateDiff() *types.BlockStorageDiff {
+	deletedAccounts := s.convertDeletedAccountSet(s.stateObjectsDestruct)
+	newAccounts := s.convertNewAccountSet(s.snapAccounts)
+	newStorage := s.convertNewStorageSet(s.snapStorage)
+	newCodes := s.convertNewCodeSet(s.codes)
+
+	return &types.BlockStorageDiff{
+		DeletedAccounts: deletedAccounts,
+		NewAccounts:     newAccounts,
+		StorageDiff:     newStorage,
+		NewCodes:        newCodes,
+	}
 }

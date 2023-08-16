@@ -1018,6 +1018,11 @@ Please note that --` + MetricsHTTPFlag.Name + ` must be set to start the server.
 		Usage:    "Data directory for store transaction trace result (default = inside datadir)",
 		Category: flags.MiscCategory,
 	}
+
+	DumpDBFlag = &flags.DirectoryFlag{
+		Name:  "dumpdb",
+		Usage: "Data directory for the dump rocksdb",
+	}
 )
 
 var (

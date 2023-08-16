@@ -123,6 +123,8 @@ var (
 
 	preimageCounter    = metrics.NewRegisteredCounter("db/preimage/total", nil)
 	preimageHitCounter = metrics.NewRegisteredCounter("db/preimage/hits", nil)
+
+	BlockStorageDiffPrefix = []byte("bsd-")
 )
 
 // LegacyTxLookupEntry is the legacy TxLookupEntry definition with some unnecessary
@@ -247,4 +249,9 @@ func accountTrieNodeKey(path []byte) []byte {
 // storageTrieNodeKey = trieNodeStoragePrefix + accountHash + nodePath.
 func storageTrieNodeKey(accountHash common.Hash, path []byte) []byte {
 	return append(append(trieNodeStoragePrefix, accountHash.Bytes()...), path...)
+}
+
+// blockStorageDiffKey = BlockStorageDiffPrefix + blockrootHash
+func blockStorageDiffKey(blockRoot common.Hash) []byte {
+	return append(BlockStorageDiffPrefix, blockRoot.Bytes()...)
 }

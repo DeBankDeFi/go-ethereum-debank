@@ -221,6 +221,7 @@ func init() {
 		exportPreimagesCommand,
 		removedbCommand,
 		dumpCommand,
+		dumpCommand2,
 		dumpGenesisCommand,
 		// See accountcmd.go:
 		accountCommand,

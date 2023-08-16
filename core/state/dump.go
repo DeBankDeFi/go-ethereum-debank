@@ -19,6 +19,7 @@ package state
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -27,11 +28,13 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
+	"github.com/holiman/uint256"
 )
 
 // DumpConfig is a set of options to control what portions of the state will be
 // iterated and collected.
 type DumpConfig struct {
+	Dir               string
 	SkipCode          bool
 	SkipStorage       bool
 	OnlyWithAddresses bool
@@ -45,6 +48,24 @@ type DumpCollector interface {
 	OnRoot(common.Hash)
 	// OnAccount is called once for each account in the trie
 	OnAccount(common.Address, DumpAccount)
+}
+
+type SimpleAccount struct {
+	Address  common.Hash
+	Balance  *uint256.Int
+	Nonce    uint64
+	CodeHash common.Hash
+}
+
+type SimpleCode struct {
+	CodeHash common.Hash
+	Code     []byte
+}
+
+type SimpleKeyValue struct {
+	Address common.Hash
+	Index   common.Hash
+	Value   *uint256.Int
 }
 
 // DumpAccount represents an account in the state.
@@ -204,6 +225,168 @@ func (s *StateDB) DumpToCollector(c DumpCollector, conf *DumpConfig) (nextKey []
 		"elapsed", common.PrettyDuration(time.Since(start)))
 
 	return nextKey
+}
+
+// DumpToFile iterates the state according to the given options and inserts
+// the items into a collector for aggregation or serialization.
+func (s *StateDB) DumpToFile(conf *DumpConfig) error {
+	// Sanitize the input to allow nil configs
+	if conf == nil {
+		conf = new(DumpConfig)
+	}
+	log.Info("Trie dumping started", "root", s.trie.Hash())
+	os.MkdirAll(conf.Dir+"/accounts", 0755)
+	os.MkdirAll(conf.Dir+"/codes", 0755)
+	os.MkdirAll(conf.Dir+"/storages", 0755)
+	it := trie.NewIterator(s.trie.NodeIterator(conf.Start))
+	var (
+		start        = time.Now()
+		logged       = time.Now()
+		accounts     = make([]*SimpleAccount, 0)
+		accountCount = 0
+		codeMap      = make(map[common.Hash]bool)
+		codes        = make([]*SimpleCode, 0)
+		codesCount   = 0
+		storages     = make([]*SimpleKeyValue, 0)
+		storageCount = 0
+	)
+	for it.Next() {
+		var data types.StateAccount
+		if err := rlp.DecodeBytes(it.Value, &data); err != nil {
+			log.Error("Failed to decode account", "err", err)
+			return err
+		}
+		balance, _ := uint256.FromBig(data.Balance)
+		da := &SimpleAccount{
+			Address:  common.BytesToHash(it.Key),
+			Balance:  balance,
+			Nonce:    data.Nonce,
+			CodeHash: common.BytesToHash(data.CodeHash),
+		}
+		accounts = append(accounts, da)
+		accountCount += 1
+		if len(accounts) >= 100000 {
+			rawbytes, err := rlp.EncodeToBytes(accounts)
+			if err != nil {
+				log.Error("Failed to encode accounts", "err", err)
+				return err
+			}
+			log.Info("write account", "accountCount", accountCount)
+			err = os.WriteFile(fmt.Sprintf("%s/accounts/%d.rlp", conf.Dir, accountCount), rawbytes, 0644)
+			if err != nil {
+				log.Error("Failed to write accounts", "err", err)
+				return err
+			}
+			accounts = make([]*SimpleAccount, 0)
+		}
+		obj := newObject(s, common.Address{}, data)
+		if _, ok := codeMap[da.CodeHash]; !ok {
+			code := obj.Code(s.db)
+			if len(code) > 0 {
+				codes = append(codes, &SimpleCode{
+					CodeHash: da.CodeHash,
+					Code:     code,
+				})
+				codeMap[da.CodeHash] = true
+				codesCount += 1
+				if len(codes) >= 10000 {
+					rawbytes, err := rlp.EncodeToBytes(codes)
+					if err != nil {
+						log.Error("Failed to encode codes", "err", err)
+						return err
+					}
+					log.Info("write code", "codesCount", codesCount)
+					err = os.WriteFile(fmt.Sprintf("%s/codes/%d.rlp", conf.Dir, codesCount), rawbytes, 0644)
+					if err != nil {
+						log.Error("Failed to write codes", "err", err)
+						return err
+					}
+					codes = make([]*SimpleCode, 0)
+				}
+			}
+		}
+		tr, err := obj.getTrie(s.db)
+		if err != nil {
+			log.Error("Failed to load storage trie", "err", err)
+			return err
+		}
+		storageIt := trie.NewIterator(tr.NodeIterator(nil))
+		for storageIt.Next() {
+			_, content, _, err := rlp.Split(storageIt.Value)
+			if err != nil {
+				return err
+			}
+			valueHash := common.BytesToHash(content)
+			value := uint256.NewInt(0).SetBytes(valueHash.Bytes())
+			storages = append(storages, &SimpleKeyValue{
+				Address: common.BytesToHash(it.Key),
+				Index:   common.BytesToHash(storageIt.Key),
+				Value:   value,
+			})
+			storageCount += 1
+			if len(storages) >= 100000 {
+				rawbytes, err := rlp.EncodeToBytes(storages)
+				if err != nil {
+					log.Error("Failed to encode storages", "err", err)
+					return err
+				}
+				log.Info("write storage", "storageCount", storageCount)
+				err = os.WriteFile(fmt.Sprintf("%s/storages/%d.rlp", conf.Dir, storageCount), rawbytes, 0644)
+				if err != nil {
+					log.Error("Failed to write storages", "err", err)
+					return err
+				}
+				storages = make([]*SimpleKeyValue, 0)
+			}
+		}
+		if time.Since(logged) > 8*time.Second {
+			log.Info("Trie dumping in progress", "at", common.BytesToHash(it.Key), "accounts", accountCount, "codes", codesCount, "storages", storageCount,
+				"elapsed", common.PrettyDuration(time.Since(start)))
+			logged = time.Now()
+		}
+	}
+	log.Info("Trie dumping complete", "accounts", accounts,
+		"elapsed", common.PrettyDuration(time.Since(start)))
+	if len(accounts) > 0 {
+		rawbytes, err := rlp.EncodeToBytes(accounts)
+		if err != nil {
+			log.Error("Failed to encode accounts", "err", err)
+			return err
+		}
+		log.Info("write account", "accountCount", accountCount)
+		err = os.WriteFile(fmt.Sprintf("%s/accounts/%d.rlp", conf.Dir, accountCount), rawbytes, 0644)
+		if err != nil {
+			log.Error("Failed to write accounts", "err", err)
+			return err
+		}
+	}
+	if len(codes) > 0 {
+		rawbytes, err := rlp.EncodeToBytes(codes)
+		if err != nil {
+			log.Error("Failed to encode codes", "err", err)
+			return err
+		}
+		log.Info("write code", "codesCount", codesCount)
+		err = os.WriteFile(fmt.Sprintf("%s/codes/%d.rlp", conf.Dir, codesCount), rawbytes, 0644)
+		if err != nil {
+			log.Error("Failed to write codes", "err", err)
+			return err
+		}
+	}
+	if len(storages) > 0 {
+		rawbytes, err := rlp.EncodeToBytes(storages)
+		if err != nil {
+			log.Error("Failed to encode storages", "err", err)
+			return err
+		}
+		log.Info("write storage", "storageCount", storageCount)
+		err = os.WriteFile(fmt.Sprintf("%s/storages/%d.rlp", conf.Dir, storageCount), rawbytes, 0644)
+		if err != nil {
+			log.Error("Failed to write storages", "err", err)
+			return err
+		}
+	}
+	return nil
 }
 
 // RawDump returns the entire state an a single large object

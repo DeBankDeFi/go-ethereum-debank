@@ -309,16 +309,14 @@ func (s *stateObject) updateTrie(db Database) (Trie, error) {
 			s.db.StorageUpdated += 1
 		}
 		// If state snapshotting is active, cache the data til commit
-		if s.db.snap != nil {
-			if storage == nil {
-				// Retrieve the old storage map, if available, create a new one otherwise
-				if storage = s.db.snapStorage[s.addrHash]; storage == nil {
-					storage = make(map[common.Hash][]byte)
-					s.db.snapStorage[s.addrHash] = storage
-				}
+		if storage == nil {
+			// Retrieve the old storage map, if available, create a new one otherwise
+			if storage = s.db.snapStorage[s.addrHash]; storage == nil {
+				storage = make(map[common.Hash][]byte)
+				s.db.snapStorage[s.addrHash] = storage
 			}
-			storage[crypto.HashData(hasher, key[:])] = v // v will be nil if it's deleted
 		}
+		storage[crypto.HashData(hasher, key[:])] = v                // v will be nil if it's deleted
 		usedStorage = append(usedStorage, common.CopyBytes(key[:])) // Copy needed for closure
 	}
 	if s.db.prefetcher != nil {
