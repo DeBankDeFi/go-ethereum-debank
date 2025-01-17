@@ -105,7 +105,7 @@ It's unclear whether any other DSL could be more secure; since there's always th
 
 ## Credential management
 
-The ability to auto-approve transaction means that the signer needs to have necessary credentials to decrypt keyfiles. These passwords are hereafter called `ksp` (keystore pass).
+The ability to auto-approve transaction means that the signer must have the credentials to decrypt keyfiles. These passwords are hereafter called `ksp` (keystore pass).
 
 ### Example implementation
 
@@ -163,7 +163,7 @@ function isLimitOk(transaction) {
 	if (stored != "") {
 		txs = JSON.parse(stored)
 	}
-	// First, remove all that have passed out of the time-window
+	// First, remove all that have passed out of the time window
 	var newtxs = txs.filter(function(tx){return tx.tstamp > windowstart});
 	console.log(txs, newtxs.length);
 
